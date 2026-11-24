@@ -1,0 +1,9 @@
+bugfixes:
+  - vmware_guest_network - Fix a performance regression introduced in 6.2.1. Reading the VLAN ID of a NIC on a distributed portgroup also read the configuration of every ESXi host attached to that portgroup, which made the module very slow in environments with many hosts.
+  - vmware_guest_network - Fix connecting a NIC to a network whose name contains ``/``, ``\`` or ``%``. vCenter returns these characters escaped, so the network wasn't found.
+  - vmware_guest_network - Don't add another NIC on every run when the VM is already connected to the requested NSX-T opaque network, or to a private VLAN portgroup selected by ``vlan_id``.
+  - vmware_guest_network - Fix ``vlan_id=0`` (untagged). Standard portgroups weren't found, a missing network wasn't reported, and another NIC was added on every run.
+  - vmware_guest_network - Fix a crash with portgroups of third-party distributed switches, which have no VLAN settings. It happened when a NIC was connected to one, or when looking up a network by ``vlan_id`` while the VM's host had access to one.
+  - vmware_guest_network - Use the type of the NSX-T opaque network instead of always ``nsx.LogicalSwitch`` when connecting a NIC to it.
+minor_changes:
+  - vmware_guest_network - Send fewer and smaller requests to vCenter. The network is looked up once instead of twice, only among the networks of the VM's host, and portgroups are read in bulk (one request per 500 portgroups) instead of one request per portgroup. This makes ``vlan_id`` lookups and failed lookups much faster when there are many portgroups. The lookup is skipped when the VM already has a NIC on the requested network, and only the portgroups of an ESXi host are read instead of its complete configuration. When removing a NIC, the VM isn't searched for again after reconfiguring it, and the task is checked every second instead of with an exponential backoff.

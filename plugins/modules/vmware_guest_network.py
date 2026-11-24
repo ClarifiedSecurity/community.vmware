@@ -73,10 +73,13 @@ options:
   vlan_id:
     description:
       - VLAN id associated with the network.
+      - For a private VLAN portgroup, this is its private VLAN id.
+      - Trunk portgroups and NSX-T opaque networks can't be selected by VLAN id, use O(network_name).
     type: int
   network_name:
     description:
       - Name of network in vSphere.
+      - Can be a standard or distributed portgroup (including NSX segments on a distributed switch) or an NSX-T opaque network.
       - Work faster then o(vlan_id) for big infrastructure with many networks.
     type: str
   device_type:
@@ -285,16 +288,36 @@ network_data:
 '''
 
 try:
-    from pyVmomi import vim
+    from pyVmomi import vim, vmodl
 except ImportError:
     pass
 
 import copy
+from urllib.parse import unquote
 from ansible.module_utils.common.text.converters import to_native
 from ansible.module_utils.basic import AnsibleModule
 from ansible_collections.community.vmware.plugins.module_utils.vmware import PyVmomi, TaskError, wait_for_task
 from ansible_collections.vmware.vmware.plugins.module_utils.argument_spec import base_argument_spec
 from ansible_collections.community.vmware.plugins.module_utils.vm_device_helper import PyVmomiDeviceHelper
+
+# Reconfiguring a NIC usually takes a few seconds. With its default exponential backoff, wait_for_task
+# checks the task after roughly 1.5s, 4s, 8.5s and 17s, so cap the interval to notice completion sooner.
+TASK_MAX_BACKOFF = 1
+
+# Number of distributed portgroups whose settings are read per request when searching a host's networks.
+# A portgroup's default port setting is about 3.5 KB, so a batch is a response of about 2 MB.
+NETWORK_BATCH_SIZE = 500
+
+# Note: pyVmomi sends a request to vCenter for every property read on a managed object (vm_obj.config,
+# network.name, ...) and doesn't cache the result, so the code below reads each property only once.
+
+
+def _name_matches(name, wanted):
+    '''
+    compare a vSphere object name with a name given by the user
+    vSphere escapes /, \\ and % in object names (as %2f, %5c and %25), so accept both forms
+    '''
+    return name is not None and wanted is not None and (name == wanted or unquote(name) == wanted)
 
 
 class PyVmomiHelper(PyVmomi):
@@ -302,6 +325,7 @@ class PyVmomiHelper(PyVmomi):
         super(PyVmomiHelper, self).__init__(module)
         self.change_detected = False
         self.device_helper = PyVmomiDeviceHelper(self.module)
+        self._host_portgroup_cache = {}
 
     def _get_network_object(self, vm_obj):
         '''
@@ -310,53 +334,157 @@ class PyVmomiHelper(PyVmomi):
         :return: network object
         :rtype: object
         '''
-        if not self.params['esxi_hostname'] or not self.params['cluster']:
-            compute_resource = vm_obj.runtime.host
-        else:
-            compute_resource = self._get_compute_resource_by_name()
-
-        pg_lookup = {}
         vlan_id = self.params['vlan_id']
         network_name = self.params['network_name']
         switch_name = self.params['switch']
 
-        for pg in vm_obj.runtime.host.config.network.portgroup:
-            pg_lookup[pg.spec.name] = {'switch': pg.spec.vswitchName, 'vlan_id': pg.spec.vlanId}
+        if not network_name and vlan_id is None:
+            # Nothing to look up, no network can match
+            return None
+
+        vm_host = vm_obj.runtime.host
+        if not self.params['esxi_hostname'] or not self.params['cluster']:
+            compute_resource = vm_host
+        else:
+            compute_resource = self._get_compute_resource_by_name()
+        if not compute_resource:
+            return None
+
+        # A host can have access to tens of thousands of networks, so their properties are read in bulk.
+        # Reading them one network at a time would send a request to vCenter for every network.
+        networks = compute_resource.network
+        names = self._get_network_names(compute_resource)
+        dvs_names = {}
+
+        def switch_matches(dvs):
+            if dvs._moId not in dvs_names:
+                dvs_names[dvs._moId] = dvs.config.name
+            return _name_matches(dvs_names[dvs._moId], switch_name)
 
         if network_name:
-            networks = self.find_network_by_name(network_name)
             for network in networks:
-                if network in compute_resource.network:
-                    if isinstance(network, vim.dvs.DistributedVirtualPortgroup):
-                        dvs = network.config.distributedVirtualSwitch
-                        if (switch_name and dvs.config.name == switch_name) or not switch_name:
-                            return network
-                    elif isinstance(network, vim.Network):
-                        return network
-
-        if compute_resource:
-            for network in compute_resource.network:
+                if not _name_matches(names.get(network._moId), network_name):
+                    continue
                 if isinstance(network, vim.dvs.DistributedVirtualPortgroup):
-                    dvs = network.config.distributedVirtualSwitch
-                    if (switch_name and dvs.config.name == switch_name) or not switch_name:
-                        if network.config.name == network_name:
-                            return network
-                        if hasattr(network.config.defaultPortConfig.vlan, 'vlanId') and \
-                           network.config.defaultPortConfig.vlan.vlanId == vlan_id:
-                            return network
-                        if hasattr(network.config.defaultPortConfig.vlan, 'pvlanId') and \
-                           network.config.defaultPortConfig.vlan.pvlanId == vlan_id:
-                            return network
-                elif isinstance(network, vim.Network):
-                    if network_name and network_name == network.name:
+                    if not switch_name or switch_matches(network.config.distributedVirtualSwitch):
                         return network
-                    if vlan_id:
-                        for k in pg_lookup.keys():
-                            if vlan_id == pg_lookup[k]['vlan_id']:
-                                if k == network.name:
-                                    return network
-                                break
+                elif isinstance(network, vim.Network):
+                    return network
+
+        # A standard portgroup matches vlan_id if it's the first portgroup on the VM's host with that VLAN
+        vlan_pg_name = None
+        if vlan_id is not None:
+            for pg in self._get_host_portgroups(vm_host):
+                if pg.spec.vlanId == vlan_id:
+                    vlan_pg_name = pg.spec.name
+                    break
+
+        # Check the networks in order, in batches, so a match early in the list doesn't read all of them
+        for start in range(0, len(networks), NETWORK_BATCH_SIZE):
+            batch = networks[start:start + NETWORK_BATCH_SIZE]
+            portgroups = self._get_portgroup_settings(
+                [network for network in batch if isinstance(network, vim.dvs.DistributedVirtualPortgroup)],
+                with_port_setting=vlan_id is not None)
+            for network in batch:
+                if isinstance(network, vim.dvs.DistributedVirtualPortgroup):
+                    pg_name, dvs, port_setting = portgroups[network._moId]
+                    if switch_name and not switch_matches(dvs):
+                        continue
+                    if _name_matches(pg_name, network_name):
+                        return network
+                    # Portgroups of third-party distributed switches have no VLAN settings
+                    vlan = getattr(port_setting, 'vlan', None)
+                    if hasattr(vlan, 'vlanId') and vlan.vlanId == vlan_id:
+                        return network
+                    if hasattr(vlan, 'pvlanId') and vlan.pvlanId == vlan_id:
+                        return network
+                elif isinstance(network, vim.Network) and (network_name or vlan_pg_name is not None):
+                    name = names[network._moId] if network._moId in names else network.name
+                    if network_name and _name_matches(name, network_name):
+                        return network
+                    if vlan_pg_name is not None and _name_matches(name, vlan_pg_name):
+                        return network
         return None
+
+    def _get_network_names(self, compute_resource):
+        '''
+        return the names of all networks of a host or cluster, read with one request
+        :param compute_resource: vim.HostSystem or vim.ComputeResource
+        :return: dict of network moId -> name
+        :rtype: dict
+        '''
+        traversal = vmodl.query.PropertyCollector.TraversalSpec(
+            type=vim.HostSystem if isinstance(compute_resource, vim.HostSystem) else vim.ComputeResource,
+            path='network', skip=False)
+        filter_spec = vmodl.query.PropertyCollector.FilterSpec(
+            objectSet=[vmodl.query.PropertyCollector.ObjectSpec(obj=compute_resource, skip=True, selectSet=[traversal])],
+            propSet=[vmodl.query.PropertyCollector.PropertySpec(type=vim.Network, all=False, pathSet=['name'])],
+        )
+        names = {}
+        for obj_content in self.content.propertyCollector.RetrieveContents([filter_spec]):
+            for prop in obj_content.propSet:
+                names[obj_content.obj._moId] = prop.val
+        return names
+
+    def _get_portgroup_settings(self, portgroups, with_port_setting):
+        '''
+        return name, distributed switch and default port setting of distributed portgroups, read with one request
+        vCenter refuses property paths into the VMware-specific fields of the port setting (like its VLAN),
+        so the whole default port setting is read, and only when it's needed.
+        :param portgroups: list of vim.dvs.DistributedVirtualPortgroup
+        :param with_port_setting: also read the default port setting
+        :return: dict of portgroup moId -> (name, distributed switch, default port setting or None)
+        :rtype: dict
+        '''
+        paths = ['config.name', 'config.distributedVirtualSwitch']
+        if with_port_setting:
+            paths.append('config.defaultPortConfig')
+        settings = {}
+        if portgroups:
+            filter_spec = vmodl.query.PropertyCollector.FilterSpec(
+                objectSet=[vmodl.query.PropertyCollector.ObjectSpec(obj=pg, skip=False) for pg in portgroups],
+                propSet=[vmodl.query.PropertyCollector.PropertySpec(
+                    type=vim.dvs.DistributedVirtualPortgroup, all=False, pathSet=paths)],
+                reportMissingObjectsInResults=True,
+            )
+            for obj_content in self.content.propertyCollector.RetrieveContents([filter_spec]):
+                if obj_content.missingSet:
+                    continue
+                values = dict((prop.name, prop.val) for prop in obj_content.propSet)
+                settings[obj_content.obj._moId] = (values.get('config.name'), values.get('config.distributedVirtualSwitch'),
+                                                   values.get('config.defaultPortConfig'))
+        for pg in portgroups:
+            if pg._moId not in settings:
+                # Missing from the bulk result, e.g. because of permissions. Read it directly so errors surface.
+                pg_config = pg.config
+                settings[pg._moId] = (pg_config.name, pg_config.distributedVirtualSwitch,
+                                      pg_config.defaultPortConfig if with_port_setting else None)
+        return settings
+
+    def _get_host_portgroups(self, host):
+        '''
+        return the standard portgroups of an ESXi host, cached for the module run
+        Only config.network.portgroup is requested because host.config is the complete host
+        configuration (storage paths, advanced options, ...) and expensive to transfer.
+        :param host: host object
+        :return: list of vim.host.PortGroup
+        :rtype: list
+        '''
+        if host._moId not in self._host_portgroup_cache:
+            filter_spec = vmodl.query.PropertyCollector.FilterSpec(
+                objectSet=[vmodl.query.PropertyCollector.ObjectSpec(obj=host, skip=False)],
+                propSet=[vmodl.query.PropertyCollector.PropertySpec(
+                    type=vim.HostSystem, all=False, pathSet=['config.network.portgroup'])],
+            )
+            portgroups = []
+            for obj_content in self.content.propertyCollector.RetrieveContents([filter_spec]):
+                for missing in obj_content.missingSet:
+                    # e.g. NoPermission, raise it like reading host.config directly would
+                    raise missing.fault
+                for prop in obj_content.propSet:
+                    portgroups = prop.val
+            self._host_portgroup_cache[host._moId] = portgroups
+        return self._host_portgroup_cache[host._moId]
 
     def _get_vlanid_from_network(self, network):
         '''
@@ -365,20 +493,26 @@ class PyVmomiHelper(PyVmomi):
         :return: vlan id as an integer
         :rtype: integer
         '''
-        vlan_id = None
+        # DistributedVirtualPortgroup and OpaqueNetwork are subclasses of vim.Network. Handle them first:
+        # their VLAN isn't defined by host portgroups, and the lookup below reads every attached host.
         if isinstance(network, vim.dvs.DistributedVirtualPortgroup):
-            vlan = network.config.defaultPortConfig.vlan
+            # Portgroups of third-party distributed switches have no VLAN settings
+            vlan = getattr(network.config.defaultPortConfig, 'vlan', None)
             if isinstance(vlan, vim.dvs.VmwareDistributedVirtualSwitch.VlanIdSpec):
-                vlan_id = vlan.vlanId
+                return vlan.vlanId
+            return None
 
-        if isinstance(network, vim.Network) and hasattr(network, 'host'):
+        if isinstance(network, vim.OpaqueNetwork):
+            return None
+
+        if isinstance(network, vim.Network):
+            network_name = network.name
             for host in network.host:
-                for pg in host.config.network.portgroup:
-                    if pg.spec.name == network.name:
-                        vlan_id = pg.spec.vlanId
-                        return vlan_id
+                for pg in self._get_host_portgroups(host):
+                    if _name_matches(network_name, pg.spec.name):
+                        return pg.spec.vlanId
 
-        return vlan_id
+        return None
 
     def _get_nics_from_vm(self, vm_obj):
         '''
@@ -390,6 +524,9 @@ class PyVmomiHelper(PyVmomi):
         '''
         nic_info_lst = []
         nics = [nic for nic in vm_obj.config.hardware.device if isinstance(nic, vim.vm.device.VirtualEthernetCard)]
+        # Looked up on first use
+        dvs_portgroups = None
+        vm_host = None
         for nic in nics:
             # common items of nic parameters
             d_item = dict(
@@ -411,24 +548,27 @@ class PyVmomiHelper(PyVmomi):
                         d_item['virtual_function_backing'] = nic.sriovBacking.virtualFunctionBacking.id
             # If a distributed port group specified
             if isinstance(nic.backing, vim.vm.device.VirtualEthernetCard.DistributedVirtualPortBackingInfo):
-                key = nic.backing.port.portgroupKey
-                for portgroup in vm_obj.network:
-                    if hasattr(portgroup, 'key') and portgroup.key == key:
-                        d_item['network_name'] = portgroup.name
-                        d_item['switch'] = portgroup.config.distributedVirtualSwitch.name
-                        d_item['vlan_id'] = self._get_vlanid_from_network(portgroup)
-                        break
+                if dvs_portgroups is None:
+                    dvs_portgroups = {pg.key: pg for pg in vm_obj.network if isinstance(pg, vim.dvs.DistributedVirtualPortgroup)}
+                portgroup = dvs_portgroups.get(nic.backing.port.portgroupKey)
+                if portgroup is not None:
+                    d_item['network_name'] = portgroup.name
+                    d_item['switch'] = portgroup.config.distributedVirtualSwitch.name
+                    d_item['vlan_id'] = self._get_vlanid_from_network(portgroup)
             # If an NSX-T port group specified
             elif isinstance(nic.backing, vim.vm.device.VirtualEthernetCard.OpaqueNetworkBackingInfo):
                 d_item['network_name'] = nic.backing.opaqueNetworkId
                 d_item['switch'] = nic.backing.opaqueNetworkType
             # If a port group specified
             elif isinstance(nic.backing, vim.vm.device.VirtualEthernetCard.NetworkBackingInfo):
-                d_item['network_name'] = nic.backing.network.name
-                d_item['vlan_id'] = self._get_vlanid_from_network(nic.backing.network)
-                if isinstance(nic.backing.network, vim.Network):
-                    for pg in vm_obj.runtime.host.config.network.portgroup:
-                        if pg.spec.name == nic.backing.network.name:
+                network = nic.backing.network
+                d_item['network_name'] = network.name
+                d_item['vlan_id'] = self._get_vlanid_from_network(network)
+                if isinstance(network, vim.Network):
+                    if vm_host is None:
+                        vm_host = vm_obj.runtime.host
+                    for pg in self._get_host_portgroups(vm_host):
+                        if _name_matches(d_item['network_name'], pg.spec.name):
                             d_item['switch'] = pg.spec.vswitchName
                             break
 
@@ -475,9 +615,7 @@ class PyVmomiHelper(PyVmomi):
 
         return None
 
-    def _new_nic_spec(self, vm_obj, nic_obj=None, network_params=None):
-        network = self._get_network_object(vm_obj)
-
+    def _new_nic_spec(self, network, nic_obj=None, network_params=None):
         if network_params:
             connected = network_params['connected']
             device_type = network_params['device_type'].lower()
@@ -542,7 +680,7 @@ class PyVmomiHelper(PyVmomi):
         nic_spec.device.wakeOnLanEnabled = wake_onlan
 
         if (pf_backing is not None or vf_backing is not None) and not isinstance(nic_spec.device, vim.vm.device.VirtualSriovEthernetCard):
-            self.module_fail_json(msg='physical_function_backing, virtual_function_backing can only be used with the sriov device type')
+            self.module.fail_json(msg='physical_function_backing, virtual_function_backing can only be used with the sriov device type')
 
         if isinstance(nic_spec.device, vim.vm.device.VirtualSriovEthernetCard):
             nic_spec.device.allowGuestOSMtuChange = allow_guest_os_mtu_change
@@ -571,9 +709,10 @@ class PyVmomiHelper(PyVmomi):
                 )
             )
         elif isinstance(network_obj, vim.OpaqueNetwork):
+            summary = network_obj.summary
             rv = vim.vm.device.VirtualEthernetCard.OpaqueNetworkBackingInfo(
-                opaqueNetworkType='nsx.LogicalSwitch',
-                opaqueNetworkId=network_obj.summary.opaqueNetworkId
+                opaqueNetworkType=summary.opaqueNetworkType or 'nsx.LogicalSwitch',
+                opaqueNetworkId=summary.opaqueNetworkId
             )
         elif isinstance(network_obj, vim.Network):
             rv = vim.vm.device.VirtualEthernetCard.NetworkBackingInfo(
@@ -581,6 +720,86 @@ class PyVmomiHelper(PyVmomi):
                 network=network_obj
             )
         return rv
+
+    def _is_network_attached(self, network, nics):
+        '''
+        check if a NIC is connected to the network, works for every kind of network
+        :param network: network object
+        :param nics: list of NIC device objects
+        :return: True if one of the NICs is connected to the network
+        :rtype: bool
+        '''
+        if isinstance(network, vim.dvs.DistributedVirtualPortgroup):
+            portgroup_key = network.key
+            return any(isinstance(nic.backing, vim.vm.device.VirtualEthernetCard.DistributedVirtualPortBackingInfo)
+                       and nic.backing.port.portgroupKey == portgroup_key for nic in nics)
+        if isinstance(network, vim.OpaqueNetwork):
+            opaque_network_id = network.summary.opaqueNetworkId
+            return any(isinstance(nic.backing, vim.vm.device.VirtualEthernetCard.OpaqueNetworkBackingInfo)
+                       and nic.backing.opaqueNetworkId == opaque_network_id for nic in nics)
+        if isinstance(network, vim.Network):
+            return any(isinstance(nic.backing, vim.vm.device.VirtualEthernetCard.NetworkBackingInfo)
+                       and nic.backing.network == network for nic in nics)
+        return False
+
+    def _nic_needs_update(self, vm_obj, nic_obj, nic_vlan_id, network_obj):
+        '''
+        check if an existing NIC differs from the requested settings
+        Must be called before _new_nic_spec, which writes the requested settings into nic_obj.
+        :param vm_obj: vm object
+        :param nic_obj: NIC device object to reconfigure
+        :param nic_vlan_id: VLAN id of the NIC's current network, as reported by _get_nics_from_vm
+        :param network_obj: requested network object, or None to keep the current network
+        :return: True if the NIC has to be reconfigured
+        :rtype: bool
+        '''
+        label = self.params['label']
+        mac_address = self.params['mac_address']
+        vlan_id = self.params['vlan_id']
+        pf_backing = self.params['physical_function_backing']
+        vf_backing = self.params['virtual_function_backing']
+
+        # A NIC already on a portgroup with the requested VLAN is left there, even if the lookup by VLAN
+        # found another portgroup with the same VLAN first
+        if network_obj is not None and not (vlan_id is not None and nic_vlan_id == vlan_id) \
+                and not self._is_network_attached(network_obj, [nic_obj]):
+            return True
+        if label and label != nic_obj.deviceInfo.label:
+            return True
+        if mac_address and mac_address != nic_obj.macAddress:
+            return True
+
+        connectable = nic_obj.connectable
+        if connectable is None:
+            return True
+        if connectable.startConnected != self.params['start_connected'] \
+                or connectable.allowGuestControl != self.params['guest_control']:
+            return True
+        # vCenter reports a NIC of a VM that isn't running as disconnected and ignores connecting it,
+        # so the connection state can only be compared when the VM is powered on
+        if connectable.connected != self.params['connected'] \
+                and vm_obj.runtime.powerState == vim.VirtualMachinePowerState.poweredOn:
+            return True
+        if nic_obj.wakeOnLanEnabled != self.params['wake_onlan']:
+            return True
+
+        if isinstance(nic_obj, vim.vm.device.VirtualSriovEthernetCard):
+            if nic_obj.allowGuestOSMtuChange != self.params['allow_guest_os_mtu_change']:
+                return True
+            sriov_backing = nic_obj.sriovBacking
+            current_pf = getattr(getattr(sriov_backing, 'physicalFunctionBacking', None), 'id', None)
+            current_vf = getattr(getattr(sriov_backing, 'virtualFunctionBacking', None), 'id', None)
+            if (pf_backing is not None and pf_backing != current_pf) or (vf_backing is not None and vf_backing != current_vf):
+                return True
+        elif pf_backing is not None or vf_backing is not None:
+            # Let _new_nic_spec report that these options need an SR-IOV adapter
+            return True
+
+        # Also true for other device types, so _new_nic_spec reports that directpath_io needs vmxnet3
+        if self.params['directpath_io'] and not getattr(nic_obj, 'uptCompatibilityEnabled', False):
+            return True
+
+        return False
 
     def _nic_absent(self, network_params=None):
         changed = False
@@ -622,14 +841,14 @@ class PyVmomiHelper(PyVmomi):
 
         try:
             task = vm_obj.ReconfigVM_Task(vim.vm.ConfigSpec(deviceChange=[device_spec]))
-            wait_for_task(task)
+            wait_for_task(task, max_backoff=TASK_MAX_BACKOFF)
         except (vim.fault.InvalidDeviceSpec, vim.fault.RestrictedVersion) as e:
             self.module.fail_json(msg='failed to reconfigure guest', detail=e.msg)
 
         if task.info.state == 'error':
             self.module.fail_json(msg='failed to reconfigure guest', detail=task.info.error.msg)
 
-        vm_obj = self.get_vm()
+        # vm_obj is still valid and pyVmomi reads properties live, no need to search for the VM again
         nic_info, nic_obj_lst = self._get_nics_from_vm(vm_obj)
 
         for nic in nic_info:
@@ -673,7 +892,6 @@ class PyVmomiHelper(PyVmomi):
                 if self.params['pvrdma_device_protocol'] is None:
                     self.params['pvrdma_device_protocol'] = 'rocev2'
 
-        network_obj = self._get_network_object(vm_obj)
         nic_info, nic_obj_lst = self._get_nics_from_vm(vm_obj)
         label_lst = [d.get('label') for d in nic_info]
         mac_addr_lst = [d.get('mac_address') for d in nic_info]
@@ -681,16 +899,25 @@ class PyVmomiHelper(PyVmomi):
         network_name_lst = [d.get('network_name') for d in nic_info]
 
         # TODO: make checks below less inelegant
-        if ((vlan_id and vlan_id in vlan_id_lst) or (network_name and network_name in network_name_lst)
-                and not mac_address
-                and not label
-                and not force):
+        # Without mac_address, label or force, any NIC on the requested network means there's nothing to do
+        any_nic = not mac_address and not label and not force
+        already_present = any_nic and ((vlan_id is not None and vlan_id in vlan_id_lst)
+                                       or (network_name and network_name in network_name_lst))
+        network_obj = None
+        if not already_present:
+            # Look the network up only now, it's expensive when the host has access to many networks
+            network_obj = self._get_network_object(vm_obj)
+            # The name and VLAN in nic_info don't identify every network (NSX-T opaque networks report their ID,
+            # PVLAN portgroups have no VLAN ID, names can be escaped), so also check the NIC backings
+            already_present = any_nic and network_obj is not None and self._is_network_attached(network_obj, nic_obj_lst)
+
+        if already_present:
             for nic in nic_info:
                 diff['before'].update({nic.get('mac_address'): copy.copy(nic)})
                 diff['after'].update({nic.get('mac_address'): copy.copy(nic)})
             return diff, changed, nic_info
 
-        if not network_obj and (network_name or vlan_id):
+        if not network_obj and (network_name or vlan_id is not None):
             self.module.fail_json(
                 msg='unable to find specified network_name/vlan_id ({0}), check parameters'.format(
                     network_name or vlan_id
@@ -701,9 +928,19 @@ class PyVmomiHelper(PyVmomi):
             diff['before'].update({nic.get('mac_address'): copy.copy(nic)})
 
         if (mac_address and mac_address in mac_addr_lst) or (label and label in label_lst):
+            target_nic = None
             for nic_obj in nic_obj_lst:
                 if (mac_address and nic_obj.macAddress == mac_address) or (label and label == nic_obj.deviceInfo.label):
-                    device_spec = self._new_nic_spec(vm_obj, nic_obj)
+                    target_nic = nic_obj
+
+            # Don't reconfigure the VM if the NIC already has the requested settings. vCenter would accept
+            # the edit and log a reconfigure event even though nothing changed.
+            target_vlan_id = next((nic.get('vlan_id') for nic in nic_info if nic.get('mac_address') == target_nic.macAddress), None)
+            if not self._nic_needs_update(vm_obj, target_nic, target_vlan_id, network_obj):
+                diff['after'] = copy.deepcopy(diff['before'])
+                return diff, changed, nic_info
+
+            device_spec = self._new_nic_spec(network_obj, target_nic)
 
             # fabricate diff for check_mode
             if self.module.check_mode:
@@ -724,7 +961,7 @@ class PyVmomiHelper(PyVmomi):
                         diff['after'].update({nic_mac: copy.deepcopy(nic)})
 
         if (not mac_address or mac_address not in mac_addr_lst) and (not label or label not in label_lst):
-            device_spec = self._new_nic_spec(vm_obj, None)
+            device_spec = self._new_nic_spec(network_obj)
             device_spec.operation = vim.vm.device.VirtualDeviceSpec.Operation.add
             if self.module.check_mode:
                 # fabricate diff/returns for checkmode
